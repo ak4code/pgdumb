@@ -1,4 +1,3 @@
-```markdown
 # PgDumb - Редактор дампов PostgreSQL в собственном формате
 
 [![Python](https://img.shields.io/badge/python-3.7%2B-blue)](https://www.python.org/downloads/)
@@ -63,4 +62,4 @@ def modify_data_block(data: bytes) -> bytes:
 ## Лицензия
 
 Этот проект распространяется по лицензии MIT. См. файл `LICENSE` для подробностей.
-```
+
