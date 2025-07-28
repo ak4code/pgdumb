@@ -38,7 +38,7 @@ class TocEntry:
         self.offset = offset
 
 
-class ReadConfig:
+class StreamHandler:
     def __init__(self):
         self.int_size: int = 4
         self.offset_size: int = 8
@@ -110,7 +110,7 @@ class PgDumb:
         self.server_version = server_version
         self.pgdump_version = pgdump_version
         self.toc_entries = toc_entries
-        self.io_config = ReadConfig()
+        self.io_config = StreamHandler()
 
     def __str__(self) -> str:
         return f"version={self.version[0]}.{self.version[1]}.{self.version[2]} compression={self.compression_method}"
@@ -123,33 +123,33 @@ class PgDumb:
         if magic != b'PGDMP':
             raise PgDumbError("File does not start with PGDMP")
 
-        io_config = ReadConfig()
+        stream_handler = StreamHandler()
 
         version = (
-            io_config.read_byte(f),
-            io_config.read_byte(f),
-            io_config.read_byte(f)
+            stream_handler.read_byte(f),
+            stream_handler.read_byte(f),
+            stream_handler.read_byte(f)
         )
 
         if version < K_VERS_1_12 or version > K_VERS_1_16:
             raise PgDumbError(f"Unsupported version: {version[0]}.{version[1]}.{version[2]}")
 
-        io_config.int_size = io_config.read_byte(f)
-        io_config.offset_size = io_config.read_byte(f)
+        stream_handler.int_size = stream_handler.read_byte(f)
+        stream_handler.offset_size = stream_handler.read_byte(f)
 
-        format_byte = io_config.read_byte(f)
+        format_byte = stream_handler.read_byte(f)
         if format_byte != 1:  # 1 = archCustom
             raise PgDumbError("File format must be 1 (custom)")
 
         if version >= K_VERS_1_15:
-            compression_byte = io_config.read_byte(f)
+            compression_byte = stream_handler.read_byte(f)
             compression_map = {0: CompressionMethod.NONE, 1: CompressionMethod.GZIP, 2: CompressionMethod.LZ4,
                 3: CompressionMethod.ZLIB}
             compression_method = compression_map.get(compression_byte, None)
             if compression_method is None:
                 raise PgDumbError("Invalid compression method")
         else:
-            compression = io_config.read_int(f)
+            compression = stream_handler.read_int(f)
             if compression == -1:
                 compression_method = CompressionMethod.ZLIB
             elif compression == 0:
@@ -159,13 +159,13 @@ class PgDumb:
             else:
                 raise PgDumbError("Invalid compression method")
 
-        created_sec = io_config.read_int(f)
-        created_min = io_config.read_int(f)
-        created_hour = io_config.read_int(f)
-        created_mday = io_config.read_int(f)
-        created_mon = io_config.read_int(f)
-        created_year = io_config.read_int(f)
-        _created_isdst = io_config.read_int(f)
+        created_sec = stream_handler.read_int(f)
+        created_min = stream_handler.read_int(f)
+        created_hour = stream_handler.read_int(f)
+        created_mday = stream_handler.read_int(f)
+        created_mon = stream_handler.read_int(f)
+        created_year = stream_handler.read_int(f)
+        _created_isdst = stream_handler.read_int(f)
 
         try:
             create_date = datetime.datetime(
@@ -179,11 +179,11 @@ class PgDumb:
         except ValueError:
             raise PgDumbError("Invalid creation date")
 
-        database_name = io_config.read_string(f)
-        server_version = io_config.read_string(f)
-        pgdump_version = io_config.read_string(f)
+        database_name = stream_handler.read_string(f)
+        server_version = stream_handler.read_string(f)
+        pgdump_version = stream_handler.read_string(f)
 
-        toc_entries = read_toc(f, io_config, version)
+        toc_entries = read_toc(f, stream_handler, version)
 
         return cls(
             version=version,
@@ -216,40 +216,40 @@ class PgDumb:
             raise PgDumbError(f"Compression method {self.compression_method} not supported")
 
 
-def read_toc(f: BinaryIO, io_config: ReadConfig, version: Tuple[int, int, int]) -> List[TocEntry]:
+def read_toc(f: BinaryIO, stream_handler: StreamHandler, version: Tuple[int, int, int]) -> List[TocEntry]:
     """Упрощённая реализация чтения ToC (заглушка, так как оригинал не предоставлен)."""
-    num_entries = io_config.read_int(f)
+    num_entries = stream_handler.read_int(f)
     toc_entries = []
     for _ in range(num_entries):
-        dump_id = io_config.read_int(f)
-        had_dumper = bool(io_config.read_int(f))
-        table_oid = io_config.read_string(f)
-        oid = io_config.read_string(f)
-        tag = io_config.read_string(f)
-        desc = io_config.read_string(f)
-        section_idx = io_config.read_int(f)
+        dump_id = stream_handler.read_int(f)
+        had_dumper = bool(stream_handler.read_int(f))
+        table_oid = stream_handler.read_string(f)
+        oid = stream_handler.read_string(f)
+        tag = stream_handler.read_string(f)
+        desc = stream_handler.read_string(f)
+        section_idx = stream_handler.read_int(f)
         section = ["SECTION_PRE_DATA", "SECTION_DATA", "SECTION_POST_DATA", "SECTION_NONE"][
             section_idx - 1] if 1 <= section_idx <= 4 else "SECTION_NONE"
-        io_config.read_string(f)  # defn
-        io_config.read_string(f)  # drop_stmt
-        io_config.read_string(f)  # copy_stmt
-        io_config.read_string(f)  # namespace
-        io_config.read_string(f)  # tablespace
+        stream_handler.read_string(f)  # defn
+        stream_handler.read_string(f)  # drop_stmt
+        stream_handler.read_string(f)  # copy_stmt
+        stream_handler.read_string(f)  # namespace
+        stream_handler.read_string(f)  # tablespace
         if version >= K_VERS_1_14:
-            io_config.read_string(f)  # tableam
-        io_config.read_string(f)  # owner
-        io_config.read_string(f)  # with_oids
+            stream_handler.read_string(f)  # tableam
+        stream_handler.read_string(f)  # owner
+        stream_handler.read_string(f)  # with_oids
         # Читаем зависимости
         dependencies = []
         while True:
-            dep = io_config.read_string(f)
+            dep = stream_handler.read_string(f)
             if not dep:
                 break
             dependencies.append(int(dep))
-        data_state = io_config.read_byte(f)
+        data_state = stream_handler.read_byte(f)
         offset = 0
-        for _ in range(io_config.offset_size):
-            bv = io_config.read_byte(f)
+        for _ in range(stream_handler.offset_size):
+            bv = stream_handler.read_byte(f)
             offset |= bv << (_ * 8)
         if data_state == K_OFFSET_POS_SET:  # K_OFFSET_POS_SET
             toc_entries.append(TocEntry(dump_id, section, desc, tag, offset))
@@ -258,7 +258,7 @@ def read_toc(f: BinaryIO, io_config: ReadConfig, version: Tuple[int, int, int]) 
 
 def modify_data_block(data: bytes) -> bytes:
     lines = data.decode('utf-8')
-    lines = lines.replace('row', 'xxxx')
+    lines = lines.replace('example.com', 'mail.ru')
     return lines.encode('utf-8')
 
 
