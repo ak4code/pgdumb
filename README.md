@@ -24,7 +24,7 @@
 **Базовый пример:**
 
 ```bash
-cat your_dump.sql.gz | gunzip | python pgdumb.py | gzip > modified_dump.sql.gz
+pg_dump -U <username> -h <ip_host> -Fc -d <db_name> | python pgdumb.py  > output.dump
 ```
 
 **Как это работает:**
