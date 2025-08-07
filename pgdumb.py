@@ -5,436 +5,888 @@ import io
 import datetime
 import subprocess
 import sys
-from dataclasses import dataclass
-from enum import Enum
-from typing import Optional, BinaryIO, Literal, Union
 import zlib
+from abc import ABCMeta, abstractmethod
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import BinaryIO, Dict, Iterator, List, Optional, Union
+
+from pg_stage.obfuscator import Obfuscator
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(levelname)s>> %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
 
 logger = logging.getLogger(__name__)
 
-K_VERS_1_12 = (1, 12, 0)  # PostgreSQL 9.0 - add separate BLOB entries
-K_VERS_1_13 = (1, 13, 0)  # PostgreSQL 11 - change search_path behavior
-K_VERS_1_14 = (1, 14, 0)  # PostgreSQL 12 - add tableam
-K_VERS_1_15 = (1, 15, 0)  # PostgreSQL 16 - add compression_algorithm in header
-K_VERS_1_16 = (1, 16, 0)  # PostgreSQL 17 - BLOB METADATA entries and multiple BLOBS, relkind
-K_OFFSET_POS_SET = 2  # Entry has data and an offset
-K_OFFSET_POS_NOT_SET = 1  # Offset not set is inline stream
-BLK_DATA = b'\x01'
-BLK_BLOBS = b'\x02'
-BLK_END = b'\x04'
-ZLIB_IN_SIZE = 4096
+Version = tuple[int, int, int]
+DumpId = int
+Offset = int
 
 
-class PgDumbError(Exception):
+class PostgreSQLVersions:
+    """Константы версий PostgreSQL для совместимости формата дампов."""
+    V1_12 = (1, 12, 0)
+    V1_13 = (1, 13, 0)
+    V1_14 = (1, 14, 0)
+    V1_15 = (1, 15, 0)
+    V1_16 = (1, 16, 0)
+
+
+class OffsetPosition:
+    """Константы позиции смещения."""
+    SET = 2
+    NOT_SET = 1
+
+
+class BlockType:
+    """Идентификаторы типов блоков."""
+    DATA = b'\x01'
+    BLOBS = b'\x02'
+    END = b'\x04'
+
+
+class Constants:
+    """Общие константы."""
+    MAGIC_HEADER = b'PGDMP'
+    CUSTOM_FORMAT = 1
+    ZLIB_CHUNK_SIZE = 4096
+    DEFAULT_BUFFER_SIZE = 8192
+
+
+class PgDumpError(Exception):
+    """Базовое исключение для ошибок обработки дампов PostgreSQL."""
     pass
 
 
 class CompressionMethod(Enum):
+    """Поддерживаемые методы сжатия."""
     NONE = "none"
     GZIP = "gzip"
     ZLIB = "zlib"
     LZ4 = "lz4"
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.value
 
 
-CompressionMethodType = Union[
-    Literal[
-        CompressionMethod.ZLIB,
-        CompressionMethod.NONE,
-        CompressionMethod.GZIP
-    ],
-    CompressionMethod,
-]
+class SectionType(Enum):
+    """Типы секций дампа."""
+    PRE_DATA = "SECTION_PRE_DATA"
+    DATA = "SECTION_DATA"
+    POST_DATA = "SECTION_POST_DATA"
+    NONE = "SECTION_NONE"
 
 
-@dataclass
-class TocEntry:
-    dump_id: int
-    section: str
-    had_dumper: bool
-    tag: Optional[str]
-    tablespace: Optional[str]
-    namespace: Optional[str]
-    tableam: Optional[str]
-    owner: Optional[str]
-    desc: Optional[str]
-    defn: Optional[str]
-    drop_stmt: Optional[str]
-    copy_stmt: Optional[str]
-    with_oids: Optional[str]
-    oid: Optional[str]
-    table_oid: Optional[str]
-    data_state: int
-    offset: int
+@dataclass(frozen=True)
+class DatabaseConnection:
+    """Конфигурация подключения к базе данных."""
+    host: str = 'localhost'
+    port: str = '5432'
+    user: str = ''
+    password: str = ''
+    database: str = ''
+
+    def to_env_dict(self) -> Dict[str, str]:
+        """
+        Преобразование в словарь переменных окружения.
+        :return: словарь переменных окружения для PostgreSQL
+        """
+        return {
+            'PGHOST': self.host,
+            'PGPORT': self.port,
+            'PGUSER': self.user,
+            'PGPASSWORD': self.password,
+            'PGDATABASE': self.database,
+        }
 
 
-@dataclass
+@dataclass(frozen=True)
 class Header:
+    """Информация заголовка файла дампа PostgreSQL."""
     magic: bytes
-    version: tuple[int, int, int]
+    version: Version
     database_name: str
     server_version: str
     pgdump_version: str
-    compression_method: CompressionMethodType
+    compression_method: CompressionMethod
     create_date: datetime.datetime
+    int_size: int = 4
+    offset_size: int = 8
 
 
-@dataclass
+@dataclass(frozen=True)
+class TocEntry:
+    """Запись оглавления (Table of Contents)."""
+    dump_id: DumpId
+    section: SectionType
+    had_dumper: bool
+    tag: Optional[str] = None
+    tablespace: Optional[str] = None
+    namespace: Optional[str] = None
+    tableam: Optional[str] = None
+    owner: Optional[str] = None
+    desc: Optional[str] = None
+    defn: Optional[str] = None
+    drop_stmt: Optional[str] = None
+    copy_stmt: Optional[str] = None
+    with_oids: Optional[str] = None
+    oid: Optional[str] = None
+    table_oid: Optional[str] = None
+    data_state: int = 0
+    offset: Offset = 0
+    dependencies: List[DumpId] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class Dump:
+    """Полная структура файла дампа."""
     header: Header
-    toc_entries: list[TocEntry]
+    toc_entries: List[TocEntry]
+
+    def get_table_data_entries(self) -> Iterator[TocEntry]:
+        """
+        Получить все записи данных таблиц.
+        :return: итератор записей с данными таблиц
+        """
+        return (entry for entry in self.toc_entries if entry.desc == "TABLE DATA")
+
+    def get_comment_entries(self) -> Iterator[TocEntry]:
+        """
+        Получить все записи комментариев.
+        :return: итератор записей комментариев
+        """
+        return (entry for entry in self.toc_entries if entry.desc == "COMMENT")
+
+    def get_entry_by_id(self, dump_id: DumpId) -> Optional[TocEntry]:
+        """
+        Найти запись TOC по ID дампа.
+        :param dump_id: идентификатор записи в дампе
+        :return: запись TOC или None
+        """
+        return next((entry for entry in self.toc_entries if entry.dump_id == dump_id), None)
 
 
-class CombinedStream(io.BufferedReader):
-    """Объединяет два потока в один последовательный поток."""
+class DataProcessor(metaclass=ABCMeta):
+    """Протокол для реализации обработчиков данных."""
 
-    def __init__(self, first_stream, second_stream):
-        self.first_stream = first_stream
-        self.second_stream = second_stream
-        super().__init__(io.BytesIO(b''))  # Инициализация базового класса
+    @abstractmethod
+    def process(self, data: Union[str, bytes]) -> Union[str, bytes]:
+        """
+        Обработать данные и вернуть модифицированную версию.
+        :param data: исходные данные (строка или байты)
+        :return: обработанные данные
+        """
+        raise NotImplementedError()
 
-    def read(self, size=-1):
-        # Сначала читаем из первого потока
-        data = self.first_stream.read(size)
-        if size == -1 or len(data) < size:
-            # Если нужно больше данных, читаем из второго потока
-            remaining = size - len(data) if size != -1 else -1
-            more_data = self.second_stream.read(remaining)
+
+class ObfuscatorProcessor(DataProcessor):
+    """Процессор обфускации из библиотеки pg_stage."""
+
+    def __init__(self, processor: Obfuscator, encoding: str = 'utf-8'):
+        """
+        Инициализация процессора обфускации.
+        :param processor: экземпляр обфускатора
+        :param encoding: кодировка для работы с текстом
+        """
+        self.encoding = encoding
+        self.processor = processor
+
+    def process(self, data: Union[str, bytes]) -> Union[str, bytes]:
+        """
+        Применить замены текста к данным.
+        :param data: исходные данные (строка или байты)
+        :return: обработанные данные
+        """
+        if isinstance(data, str):
+            return self.processor._parse_line(line=data)
+
+        try:
+            lines = data.decode('utf-8').splitlines()
+            processed_lines = [self.processor._parse_line(line=line) for line in lines]
+            return '\n'.join(processed_lines).encode(self.encoding)
+        except UnicodeDecodeError as e:
+            logger.warning(f"Failed to decode data as {self.encoding}: {e}")
+            return data
+
+
+class StreamCombiner:
+    """Объединяет несколько потоков в один последовательный поток."""
+
+    def __init__(self, *streams: BinaryIO):
+        """
+        Инициализация с несколькими потоками.
+        :param streams: потоки для объединения
+        """
+        self.streams = list(streams)
+        self.current_index = 0
+
+    def read(self, size: int = -1) -> bytes:
+        """
+        Чтение данных из потоков последовательно.
+        :param size: количество байт для чтения
+        :return: прочитанные данные
+        """
+        if self.current_index >= len(self.streams):
+            return b''
+
+        data = self.streams[self.current_index].read(size)
+
+        if size != -1 and len(data) < size and data != b'':
+            remaining = size - len(data)
+            self.current_index += 1
+            more_data = self.read(remaining)
             data += more_data
+        elif not data:
+            self.current_index += 1
+            return self.read(size)
+
         return data
 
 
 class DumpIO:
-    def __init__(self):
-        self.int_size: int = 4
-        self.offset_size: int = 8
+    """Утилиты бинарного I/O для формата дампов PostgreSQL."""
 
-    def read_byte(self, buffer: BinaryIO) -> int:
-        """Читает один байт из потока."""
-        try:
-            return struct.unpack('B', buffer.read(1))[0]
-        except struct.error:
-            raise PgDumbError("Unexpected EOF while reading byte")
+    def __init__(self, int_size: int = 4, offset_size: int = 8):
+        """
+        Инициализация с размерами типов данных.
+        :param int_size: размер целого числа в байтах
+        :param offset_size: размер смещения в байтах
+        """
+        self.int_size = int_size
+        self.offset_size = offset_size
 
-    def read_int(self, buffer: BinaryIO) -> int:
-        """Читает целое число с учетом знака."""
-        sign = self.read_byte(buffer)
-        if sign is None:
-            return None
-        bs, bv, value = 0, 0, 0
-        for _ in range(self.int_size):
-            bv = (self.read_byte(buffer) or 0) & 0xFF
-            if bv != 0:
-                value += (bv << bs)
-            bs += 8
+    def read_byte(self, stream: BinaryIO) -> int:
+        """
+        Чтение одного байта.
+        :param stream: поток для чтения
+        :return: значение байта
+        """
+        data = stream.read(1)
+        if not data:
+            raise PgDumpError("Unexpected EOF while reading byte")
+        return struct.unpack('B', data)[0]
+
+    def read_int(self, stream: BinaryIO) -> int:
+        """
+        Чтение знакового целого числа с переменным размером.
+        :param stream: поток для чтения
+        :return: значение целого числа
+        """
+        sign = self.read_byte(stream)
+        value = 0
+
+        for i in range(self.int_size):
+            byte_value = self.read_byte(stream)
+            if byte_value != 0:
+                value += byte_value << (i * 8)
+
         return -value if sign else value
 
-    def read_string(self, buffer: BinaryIO) -> str:
-        """Читает строку с длиной, закодированную в UTF-8."""
-        length = self.read_int(buffer)
+    def read_string(self, stream: BinaryIO) -> str:
+        """
+        Чтение строки UTF-8 с префиксом длины.
+        :param stream: поток для чтения
+        :return: строка
+        """
+        length = self.read_int(stream)
         if length <= 0:
             return ""
-        data = buffer.read(length)
+
+        data = stream.read(length)
         if len(data) != length:
-            raise PgDumbError("Unexpected EOF while reading string")
-        return data.decode('utf-8')
+            raise PgDumpError(f"Expected {length} bytes, got {len(data)}")
 
-    def read_data(self, buffer: BinaryIO, offset: int) -> BinaryIO:
-        """Читает блок данных по смещению."""
-        buffer.seek(offset)
-        block_type = buffer.read(1)
-        if not block_type:
-            raise PgDumbError("Unexpected EOF while reading block type")
+        try:
+            return data.decode('utf-8')
+        except UnicodeDecodeError as e:
+            raise PgDumpError(f"Invalid UTF-8 string: {e}")
 
-        dump_id = self.read_int(buffer)
-        if block_type != BLK_DATA:
-            raise PgDumbError(f"Expected BLK_DATA, got {block_type!r}")
-
-        size = self.read_int(buffer)
-        data = buffer.read(size)
-        if len(data) != size:
-            raise PgDumbError("Unexpected EOF while reading data block")
-
-        return io.BytesIO(data)
-
-    def read_stream_data(self, buffer: io.BytesIO, stream: BinaryIO, data_len: int) -> bytes:
-        data = buffer.read(data_len)
-        while len(data) < data_len:
-            more = stream.read(data_len - len(data))
-            if not more:
-                raise PgDumbError("Unexpected EOF in BLK_DATA")
-            data += more
-        return data
+    def read_offset(self, stream: BinaryIO) -> Offset:
+        """
+        Чтение значения смещения.
+        :param stream: поток для чтения
+        :return: значение смещения
+        """
+        offset = 0
+        for i in range(self.offset_size):
+            byte_value = self.read_byte(stream)
+            offset |= byte_value << (i * 8)
+        return offset
 
     def write_int(self, value: int) -> bytes:
+        """
+        Запись знакового целого числа.
+        :param value: значение для записи
+        :return: байты для записи
+        """
         is_negative = value < 0
         value = abs(value)
-        out = bytearray()
-        out.append(1 if is_negative else 0)
+
+        result = bytearray()
+        result.append(1 if is_negative else 0)
+
         for i in range(self.int_size):
-            out.append((value >> (i * 8)) & 0xFF)
-        return bytes(out)
+            result.append((value >> (i * 8)) & 0xFF)
+
+        return bytes(result)
 
 
-def parse_header_and_toc_entries(buffer: BinaryIO, dump_io: DumpIO) -> 'Dump':
-    """Читает и парсит заголовок архива из потока."""
-    magic = buffer.read(5)
-    if magic != b'PGDMP':
-        raise PgDumbError("File does not start with PGDMP")
+class HeaderParser:
+    """Парсер заголовков файлов дампов PostgreSQL."""
 
-    version = (
-        dump_io.read_byte(buffer),
-        dump_io.read_byte(buffer),
-        dump_io.read_byte(buffer)
-    )
+    def __init__(self, dio: DumpIO):
+        """
+        Инициализация парсера.
+        :param dio: объект для работы с бинарным I/O
+        """
+        self.dio = dio
 
-    if version < K_VERS_1_12 or version > K_VERS_1_16:
-        raise PgDumbError(f"Unsupported version: {version[0]}.{version[1]}.{version[2]}")
+    def parse(self, stream: BinaryIO) -> Header:
+        """
+        Парсинг заголовка файла дампа.
+        :param stream: поток для чтения
+        :return: объект заголовка
+        """
+        magic = stream.read(5)
+        if magic != Constants.MAGIC_HEADER:
+            raise PgDumpError(f"Invalid magic header: {magic!r}")
 
-    dump_io.int_size = dump_io.read_byte(buffer)
-    dump_io.offset_size = dump_io.read_byte(buffer)
-
-    format_byte = dump_io.read_byte(buffer)
-    if format_byte != 1:  # 1 = archCustom
-        raise PgDumbError("File format must be 1 (custom)")
-
-    if version >= K_VERS_1_15:
-        compression_byte = dump_io.read_byte(buffer)
-        compression_map = {
-            0: CompressionMethod.NONE,
-            1: CompressionMethod.GZIP,
-            2: CompressionMethod.LZ4,
-            3: CompressionMethod.ZLIB,
-        }
-        compression_method = compression_map.get(compression_byte, None)
-        if compression_method is None:
-            raise PgDumbError("Invalid compression method")
-    else:
-        compression = dump_io.read_int(buffer)
-        if compression == -1:
-            compression_method = CompressionMethod.ZLIB
-        elif compression == 0:
-            compression_method = CompressionMethod.NONE
-        elif 1 <= compression <= 9:
-            compression_method = CompressionMethod.GZIP
-        else:
-            raise PgDumbError("Invalid compression method")
-
-    created_sec = dump_io.read_int(buffer)
-    created_min = dump_io.read_int(buffer)
-    created_hour = dump_io.read_int(buffer)
-    created_mday = dump_io.read_int(buffer)
-    created_mon = dump_io.read_int(buffer)
-    created_year = dump_io.read_int(buffer)
-    _created_isdst = dump_io.read_int(buffer)
-
-    try:
-        create_date = datetime.datetime(
-            year=created_year + 1900,
-            month=created_mon + 1,
-            day=created_mday,
-            hour=created_hour,
-            minute=created_min,
-            second=created_sec
+        version = (
+            self.dio.read_byte(stream),
+            self.dio.read_byte(stream),
+            self.dio.read_byte(stream)
         )
-    except ValueError:
-        raise PgDumbError("Invalid creation date")
 
-    database_name = dump_io.read_string(buffer)
-    server_version = dump_io.read_string(buffer)
-    pgdump_version = dump_io.read_string(buffer)
+        self._validate_version(version)
 
-    toc_entries = parse_toc_entries(buffer, dump_io, version)
+        int_size = self.dio.read_byte(stream)
+        offset_size = self.dio.read_byte(stream)
+        self.dio.int_size = int_size
+        self.dio.offset_size = offset_size
 
-    return Dump(
-        header=Header(
+        format_byte = self.dio.read_byte(stream)
+        if format_byte != Constants.CUSTOM_FORMAT:
+            raise PgDumpError(f"Unsupported format: {format_byte}")
+
+        compression_method = self._parse_compression(stream, version)
+        create_date = self._parse_date(stream)
+
+        database_name = self.dio.read_string(stream)
+        server_version = self.dio.read_string(stream)
+        pgdump_version = self.dio.read_string(stream)
+
+        return Header(
             magic=magic,
             version=version,
-            compression_method=compression_method,
-            create_date=create_date,
             database_name=database_name,
             server_version=server_version,
             pgdump_version=pgdump_version,
-        ),
-        toc_entries=toc_entries,
-    )
+            compression_method=compression_method,
+            create_date=create_date,
+            int_size=int_size,
+            offset_size=offset_size
+        )
+
+    def _validate_version(self, version: Version) -> None:
+        """
+        Валидация версии формата дампа.
+        :param version: версия для проверки
+        """
+        if version < PostgreSQLVersions.V1_12 or version > PostgreSQLVersions.V1_16:
+            version_str = '.'.join(map(str, version))
+            raise PgDumpError(f"Unsupported version: {version_str}")
+
+    def _parse_compression(self, stream: BinaryIO, version: Version) -> CompressionMethod:
+        """
+        Парсинг метода сжатия в зависимости от версии.
+        :param stream: поток для чтения
+        :param version: версия формата
+        :return: метод сжатия
+        """
+        if version >= PostgreSQLVersions.V1_15:
+            compression_byte = self.dio.read_byte(stream)
+            compression_map = {
+                0: CompressionMethod.NONE,
+                1: CompressionMethod.GZIP,
+                2: CompressionMethod.LZ4,
+                3: CompressionMethod.ZLIB,
+            }
+            compression_method = compression_map.get(compression_byte)
+            if compression_method is None:
+                raise PgDumpError(f"Unknown compression method: {compression_byte}")
+        else:
+            compression = self.dio.read_int(stream)
+            if compression == -1:
+                compression_method = CompressionMethod.ZLIB
+            elif compression == 0:
+                compression_method = CompressionMethod.NONE
+            elif 1 <= compression <= 9:
+                compression_method = CompressionMethod.GZIP
+            else:
+                raise PgDumpError(f"Invalid compression level: {compression}")
+
+        return compression_method
+
+    def _parse_date(self, stream: BinaryIO) -> datetime.datetime:
+        """
+        Парсинг даты создания из дампа.
+        :param stream: поток для чтения
+        :return: дата создания
+        """
+        sec = self.dio.read_int(stream)
+        minute = self.dio.read_int(stream)
+        hour = self.dio.read_int(stream)
+        day = self.dio.read_int(stream)
+        month = self.dio.read_int(stream)
+        year = self.dio.read_int(stream)
+        _isdst = self.dio.read_int(stream)
+
+        try:
+            return datetime.datetime(
+                year=year + 1900,
+                month=month + 1,
+                day=day,
+                hour=hour,
+                minute=minute,
+                second=sec
+            )
+        except ValueError as e:
+            raise PgDumpError(f"Invalid creation date: {e}")
 
 
-def parse_toc_entries(buffer: BinaryIO, dump_io: DumpIO, version: tuple[int, int, int]) -> list[TocEntry]:
-    """Упрощённая реализация чтения ToC."""
-    num_entries = dump_io.read_int(buffer)
-    toc_entries = []
-    for _ in range(num_entries):
-        dump_id = dump_io.read_int(buffer)
-        had_dumper = bool(dump_io.read_int(buffer))
-        table_oid = dump_io.read_string(buffer)
-        oid = dump_io.read_string(buffer)
-        tag = dump_io.read_string(buffer)
-        desc = dump_io.read_string(buffer)
-        section_idx = dump_io.read_int(buffer)
-        section = [
-            "SECTION_PRE_DATA",
-            "SECTION_DATA",
-            "SECTION_POST_DATA",
-            "SECTION_NONE"
-        ][section_idx - 1] if 1 <= section_idx <= 4 else "SECTION_NONE"
-        defn = dump_io.read_string(buffer)
-        drop_stmt = dump_io.read_string(buffer)
-        copy_stmt = dump_io.read_string(buffer)
-        namespace = dump_io.read_string(buffer)
-        tablespace = dump_io.read_string(buffer)
+class TocParser:
+    """Парсер записей оглавления (Table of Contents)."""
+
+    def __init__(self, dio: DumpIO):
+        """
+        Инициализация парсера TOC.
+        :param dio: объект для работы с бинарным I/O
+        """
+        self.dio = dio
+
+    def parse(self, stream: BinaryIO, version: Version) -> List[TocEntry]:
+        """
+        Парсинг всех записей TOC.
+        :param stream: поток для чтения
+        :param version: версия формата дампа
+        :return: список записей TOC
+        """
+        num_entries = self.dio.read_int(stream)
+        return [self._parse_entry(stream, version) for _ in range(num_entries)]
+
+    def _parse_entry(self, stream: BinaryIO, version: Version) -> TocEntry:
+        """
+        Парсинг одной записи TOC.
+        :param stream: поток для чтения
+        :param version: версия формата дампа
+        :return: запись TOC
+        """
+        dump_id = self.dio.read_int(stream)
+        had_dumper = bool(self.dio.read_int(stream))
+
+        table_oid = self.dio.read_string(stream)
+        oid = self.dio.read_string(stream)
+        tag = self.dio.read_string(stream)
+        desc = self.dio.read_string(stream)
+
+        section_idx = self.dio.read_int(stream)
+        section = self._parse_section(section_idx)
+
+        defn = self.dio.read_string(stream)
+        drop_stmt = self.dio.read_string(stream)
+        copy_stmt = self.dio.read_string(stream)
+        namespace = self.dio.read_string(stream)
+        tablespace = self.dio.read_string(stream)
+
         tableam = None
-        if version >= K_VERS_1_14:
-            tableam = dump_io.read_string(buffer)
-        owner = dump_io.read_string(buffer)
-        with_oids = dump_io.read_string(buffer)
+        if version >= PostgreSQLVersions.V1_14:
+            tableam = self.dio.read_string(stream)
 
+        owner = self.dio.read_string(stream)
+        with_oids = self.dio.read_string(stream)
+
+        dependencies = self._parse_dependencies(stream)
+
+        data_state = self.dio.read_byte(stream)
+        offset = self.dio.read_offset(stream)
+
+        return TocEntry(
+            dump_id=dump_id,
+            had_dumper=had_dumper,
+            tag=tag or None,
+            desc=desc or None,
+            section=section,
+            defn=defn or None,
+            copy_stmt=copy_stmt or None,
+            drop_stmt=drop_stmt or None,
+            namespace=namespace or None,
+            tablespace=tablespace or None,
+            tableam=tableam,
+            data_state=data_state,
+            owner=owner or None,
+            offset=offset,
+            with_oids=with_oids or None,
+            table_oid=table_oid or None,
+            oid=oid or None,
+            dependencies=dependencies
+        )
+
+    def _parse_section(self, section_idx: int) -> SectionType:
+        """
+        Парсинг типа секции по индексу.
+        :param section_idx: индекс секции
+        :return: тип секции
+        """
+        section_map = {
+            1: SectionType.PRE_DATA,
+            2: SectionType.DATA,
+            3: SectionType.POST_DATA,
+            4: SectionType.NONE,
+        }
+        return section_map.get(section_idx, SectionType.NONE)
+
+    def _parse_dependencies(self, stream: BinaryIO) -> list[DumpId]:
+        """
+        Парсинг списка зависимостей.
+        :param stream: поток для чтения
+        :return: список ID зависимостей
+        """
         dependencies = []
         while True:
-            dep = dump_io.read_string(buffer)
-            if not dep:
+            dep_str = self.dio.read_string(stream)
+            if not dep_str:
                 break
-            dependencies.append(int(dep))
-        data_state = dump_io.read_byte(buffer)
-        offset = 0
-        for _ in range(dump_io.offset_size):
-            bv = dump_io.read_byte(buffer)
-            offset |= bv << (_ * 8)
-
-        toc_entries.append(
-            TocEntry(
-                dump_id=dump_id,
-                had_dumper=had_dumper,
-                tag=tag,
-                desc=desc,
-                section=section,
-                defn=defn,
-                copy_stmt=copy_stmt,
-                drop_stmt=drop_stmt,
-                namespace=namespace,
-                tablespace=tablespace,
-                tableam=tableam,
-                data_state=data_state,
-                owner=owner,
-                offset=offset,
-                with_oids=with_oids,
-                table_oid=table_oid,
-                oid=oid,
-            )
-        )
-    return toc_entries
+            try:
+                dependencies.append(int(dep_str))
+            except ValueError:
+                logger.warning(f"Invalid dependency ID: {dep_str}")
+        return dependencies
 
 
-def modify_data_block(data: bytes) -> bytes:
-    lines = data.decode('utf-8')
-    lines = lines.replace('live.com', 'obfuscated.live.com')
-    return lines.encode('utf-8')
+class DataBlockProcessor:
+    """Обработчик блоков данных с поддержкой сжатия."""
 
+    def __init__(self, dio: DumpIO, processor: DataProcessor):
+        """
+        Инициализация процессора блоков данных.
+        :param dio: объект для работы с бинарным I/O
+        :param processor: процессор данных
+        """
+        self.dio = dio
+        self.processor = processor
 
-def parse_dump(stdin: io.BufferedReader, stdout: io.BufferedWriter):
-    """Обрабатывает потоковый дамп PostgreSQL с правильным разделением заголовка и данных."""
-    dump_io = DumpIO()
+    def process_block(
+        self,
+        input_stream: BinaryIO,
+        output_stream: BinaryIO,
+        dump_id: DumpId,
+        compression: CompressionMethod
+    ) -> None:
+        """
+        Обработка одного блока данных.
+        :param input_stream: входной поток
+        :param output_stream: выходной поток
+        :param dump_id: ID записи дампа
+        :param compression: метод сжатия
+        """
+        if compression == CompressionMethod.ZLIB:
+            self._process_compressed_block(input_stream, output_stream, dump_id)
+        else:
+            self._process_uncompressed_block(input_stream, output_stream, dump_id)
 
-    # Этап 1: Чтение ровно столько данных, сколько нужно для заголовка и TOC
-    header_data = io.BytesIO()
-    dump = None
-    while dump is None:
-        chunk = stdin.read(4096)
-        if not chunk:
-            raise PgDumbError("Unexpected EOF while reading header/TOC")
-        header_data.write(chunk)
-        header_data.seek(0)
-        try:
-            dump = parse_header_and_toc_entries(header_data, dump_io)
-        except PgDumbError:
-            header_data.seek(0, io.SEEK_END)
-
-    # Получаем позицию, до которой мы прочитали (конец TOC)
-    toc_end_pos = header_data.tell()
-    header_data.seek(0)
-
-    # Записываем заголовок и TOC в вывод
-    stdout.write(header_data.read(toc_end_pos))
-    stdout.flush()
-
-    # Оставшиеся данные (если мы прочитали больше, чем нужно) - это начало данных дампа
-    remaining_data = header_data.read()
-
-    # Создаем объединенный поток для обработки данных
-    if remaining_data:
-        # Если есть остаток, создаем цепочку: остаток + stdin
-        data_stream = io.BytesIO(remaining_data)
-        data_stream = CombinedStream(data_stream, stdin)
-    else:
-        # Если остатка нет, используем просто stdin
-        data_stream = stdin
-
-    # Обрабатываем блоки данных
-    process_data_blocks(data_stream, stdout, dump, dump_io)
-
-    stdout.write(stdin.read())
-    stdout.flush()
-
-
-def process_data_blocks(
-    input_stream: Union[io.BufferedReader, CombinedStream],
-    output_stream: io.BufferedWriter,
-    dump: Dump,
-    dump_io: DumpIO
-):
-    """Обрабатывает блоки данных с учетом сжатия."""
-    block_type = input_stream.read(1)
-    if block_type == BLK_DATA:
-        dump_ids_table_data = {entry.dump_id for entry in dump.toc_entries if entry.desc == "TABLE DATA"}
-        buffer = io.BytesIO()
-        chunk = b''
+    def _process_compressed_block(
+        self,
+        input_stream: BinaryIO,
+        output_stream: BinaryIO,
+        dump_id: DumpId
+    ) -> None:
+        """
+        Обработка сжатого блока данных ZLIB.
+        :param input_stream: входной поток
+        :param output_stream: выходной поток
+        :param dump_id: ID записи дампа
+        """
+        decompressed_data = io.BytesIO()
         decompressor = zlib.decompressobj()
+        remaining_chunk = b''
 
-        dump_id = dump_io.read_int(input_stream)
-        if dump_id in dump_ids_table_data:
-            while True:
-                chunk_size = dump_io.read_int(input_stream)
-                if not chunk_size:
+        while True:
+            chunk_size = self.dio.read_int(input_stream)
+            if chunk_size == 0:
+                break
+
+            chunk_data = input_stream.read(chunk_size)
+            if len(chunk_data) != chunk_size:
+                raise PgDumpError(f"Expected {chunk_size} bytes, got {len(chunk_data)}")
+
+            remaining_chunk += chunk_data
+            try:
+                decompressed_chunk = decompressor.decompress(remaining_chunk)
+                decompressed_data.write(decompressed_chunk)
+                remaining_chunk = decompressor.unconsumed_tail
+            except zlib.error as e:
+                raise PgDumpError(f"Decompression error: {e}")
+
+            if chunk_size < Constants.ZLIB_CHUNK_SIZE:
+                break
+
+        try:
+            final_data = decompressor.flush()
+            decompressed_data.write(final_data)
+        except zlib.error as e:
+            raise PgDumpError(f"Final decompression error: {e}")
+
+        original_data = decompressed_data.getvalue()
+        processed_data = self.processor.process(original_data)
+
+        compressed_data = zlib.compress(processed_data)
+        self._write_data_block(output_stream, dump_id, compressed_data)
+
+    def _process_uncompressed_block(
+        self,
+        input_stream: BinaryIO,
+        output_stream: BinaryIO,
+        dump_id: DumpId
+    ) -> None:
+        """
+        Обработка несжатого блока данных.
+        :param input_stream: входной поток
+        :param output_stream: выходной поток
+        :param dump_id: ID записи дампа
+        """
+        size = self.dio.read_int(input_stream)
+        data = input_stream.read(size)
+
+        if len(data) != size:
+            raise PgDumpError(f"Expected {size} bytes, got {len(data)}")
+
+        processed_data = self.processor.process(data)
+        self._write_data_block(output_stream, dump_id, processed_data)
+
+    def _write_data_block(self, output_stream: BinaryIO, dump_id: DumpId, data: bytes) -> None:
+        """
+        Запись обработанного блока данных в выходной поток.
+        :param output_stream: выходной поток
+        :param dump_id: ID записи дампа
+        :param data: данные для записи
+        """
+        output_stream.write(BlockType.DATA)
+        output_stream.write(self.dio.write_int(dump_id))
+        output_stream.write(self.dio.write_int(len(data)))
+        output_stream.write(data)
+        output_stream.flush()
+
+
+class DumpProcessor:
+    """Главный процессор дампов PostgreSQL."""
+
+    def __init__(self, data_processor: DataProcessor):
+        """
+        Инициализация процессора дампов.
+        :param data_processor: обработчик данных
+        """
+        self.data_processor = data_processor
+        self.dio = DumpIO()
+
+    def process_stream(self, input_stream: BinaryIO, output_stream: BinaryIO) -> None:
+        """
+        Обработка дампа из входного потока в выходной поток.
+        :param input_stream: входной поток
+        :param output_stream: выходной поток
+        """
+        try:
+            dump, combined_stream = self._parse_header_and_toc(input_stream, output_stream)
+            self._process_data_blocks(combined_stream, output_stream, dump)
+        except Exception as e:
+            logger.error(f"Error processing dump: {e}")
+            raise
+
+    def _parse_header_and_toc(self, input_stream: BinaryIO, output_stream: BinaryIO) -> tuple[Dump, StreamCombiner]:
+        """
+        Парсинг заголовка и TOC с записью в выходной поток.
+        :param input_stream: входной поток
+        :param output_stream: выходной поток
+        :return: объект дампа и комбинированный поток
+        """
+        buffer = io.BytesIO()
+        dump = None
+
+        while dump is None:
+            chunk = input_stream.read(Constants.DEFAULT_BUFFER_SIZE)
+            if not chunk:
+                raise PgDumpError("Unexpected EOF while reading header/TOC")
+
+            buffer.write(chunk)
+            buffer.seek(0)
+
+            try:
+                header_parser = HeaderParser(self.dio)
+                header = header_parser.parse(buffer)
+
+                toc_parser = TocParser(self.dio)
+                toc_entries = toc_parser.parse(buffer, header.version)
+
+                dump = Dump(header=header, toc_entries=toc_entries)
+
+            except (PgDumpError, struct.error):
+                buffer.seek(0, io.SEEK_END)
+                continue
+
+        toc_end_pos = buffer.tell()
+        buffer.seek(0)
+        output_stream.write(buffer.read(toc_end_pos))
+        output_stream.flush()
+
+        remaining_data = buffer.read()
+        combined_stream = StreamCombiner(io.BytesIO(remaining_data), input_stream)
+
+        return dump, combined_stream
+
+    def _process_data_blocks(
+        self,
+        input_stream: Union[BinaryIO, StreamCombiner],
+        output_stream: BinaryIO,
+        dump: Dump
+    ) -> None:
+        """
+        Обработка блоков данных в дампе.
+        :param input_stream: входной поток
+        :param output_stream: выходной поток
+        :param dump: объект дампа
+        """
+        dump_comments = {entry.defn for entry in dump.get_comment_entries()}
+        dump_copy_stmts = {entry.dump_id: entry.copy_stmt for entry in dump.get_table_data_entries()}
+        dump_ids = {entry.dump_id for entry in dump.get_table_data_entries()}
+        processor = DataBlockProcessor(self.dio, self.data_processor)
+
+        for comment in dump_comments:
+            self.data_processor.process(comment)
+
+        while True:
+            block_type = input_stream.read(1)
+            if not block_type:
+                break
+
+            if block_type == BlockType.DATA:
+                dump_id = self.dio.read_int(input_stream)
+
+                if dump_id in dump_ids:
+                    self.data_processor.process(dump_copy_stmts[dump_id])
+                    processor.process_block(
+                        input_stream,
+                        output_stream,
+                        dump_id,
+                        dump.header.compression_method
+                    )
+                else:
+                    self._pass_through_block(input_stream, output_stream, block_type, dump_id)
+            else:
+                output_stream.write(block_type)
+                if block_type == BlockType.END:
                     break
-                chunk += input_stream.read(chunk_size)
-                buffer.write(decompressor.decompress(chunk))
-                chunk = decompressor.unconsumed_tail
-                if chunk_size < ZLIB_IN_SIZE:
-                    break
-            buffer.write(decompressor.flush())
-            new_data = modify_data_block(buffer.getvalue())
 
-            new_compressed = zlib.compress(new_data)
-
-            # Запись в stdout
-            output_stream.write(BLK_DATA)
-            output_stream.write(dump_io.write_int(dump_id))
-            output_stream.write(dump_io.write_int(len(new_compressed)))
-            output_stream.write(new_compressed)
-            output_stream.flush()
-    else:
+    def _pass_through_block(
+        self,
+        input_stream: BinaryIO,
+        output_stream: BinaryIO,
+        block_type: bytes,
+        dump_id: DumpId
+    ) -> None:
+        """
+        Передача блока без обработки.
+        :param input_stream: входной поток
+        :param output_stream: выходной поток
+        :param block_type: тип блока
+        :param dump_id: ID записи дампа
+        """
         output_stream.write(block_type)
+        output_stream.write(self.dio.write_int(dump_id))
+
+        size = self.dio.read_int(input_stream)
+        output_stream.write(self.dio.write_int(size))
+
+        remaining = size
+        while remaining > 0:
+            chunk_size = min(remaining, Constants.DEFAULT_BUFFER_SIZE)
+            chunk = input_stream.read(chunk_size)
+            if not chunk:
+                break
+            output_stream.write(chunk)
+            remaining -= len(chunk)
+
+        output_stream.flush()
+
+
+@contextmanager
+def create_pg_dump_process(connection: DatabaseConnection, tables: Optional[List[str]] = None):
+    """
+    Создание подпроцесса pg_dump с правильным управлением ресурсами.
+    :param connection: конфигурация подключения к БД
+    :param tables: список таблиц для дампа (опционально)
+    :yield: объект подпроцесса
+    """
+    cmd = ['pg_dump', '-Fc']
+
+    if tables:
+        for table in tables:
+            cmd.extend(['-t', table])
+
+    env = os.environ.copy()
+    env.update(connection.to_env_dict())
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env
+    )
+
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait()
+
+
+def main():
+    """Точка входа в программу."""
+    connection = DatabaseConnection(
+        host='localhost',
+        port='5432',
+        user='secret',
+        password='secret',
+        database='secret',
+    )
+
+    dump_tables = []
+
+    data_processor = ObfuscatorProcessor(
+        Obfuscator(locale='ru', delete_tables_by_pattern=[r'\_historical'])
+    )
+    dump_processor = DumpProcessor(data_processor)
+
+    try:
+        with create_pg_dump_process(connection, dump_tables) as process:
+            dump_processor.process_stream(process.stdout, sys.stdout.buffer)
+
+            return_code = process.wait()
+            if return_code != 0:
+                stderr_output = process.stderr.read().decode('utf-8')
+                logger.error(f"pg_dump failed with code {return_code}: {stderr_output}")
+                sys.exit(return_code)
+
+    except KeyboardInterrupt:
+        logger.info("Process interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    env = os.environ.copy()
-    env['PGHOST'] = 'localhost'
-    env['PGPORT'] = '5432'
-    env['PGUSER'] = '<secret>'
-    env['PGPASSWORD'] = '<secret>'
-    env['PGDATABASE'] = '<secret>'
-    process = subprocess.Popen(
-        ['pg_dump', '-Fc'],  # можно указать определенную таблицу  '-t', 'auth_user'
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    parse_dump(process.stdout, sys.stdout.buffer)
+    main()
